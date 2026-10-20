@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { mergeSnapshot, type MergeFn } from '../lib/realtime/merge';
+import { getRegistry, type SubscriptionRegistry } from '../lib/realtime/registry';
+import type { RealtimeClient } from '../lib/realtime/client';
 
 export type RealtimeStatus = 'idle' | 'loading' | 'live' | 'polling' | 'error';
 
@@ -18,6 +20,10 @@ export interface UseRealtimeTopicOptions<T> {
   connected?: boolean;
   /** Subscribes to a topic; returns an unsubscribe function. */
   subscribe?: (topic: string, onEvent: (event: T) => void) => () => void;
+  /** Realtime client used to resolve the shared subscription registry. */
+  client?: RealtimeClient;
+  /** Explicit registry override (tests / inspector). */
+  registry?: SubscriptionRegistry;
 }
 
 export interface UseRealtimeTopicResult<T> {
@@ -33,7 +39,8 @@ const DEFAULT_POLL_INTERVAL_MS = 30_000;
  *
  * Subscribes on mount, tears down on unmount, reacts to connection health,
  * and falls back to REST polling when realtime is disabled or unavailable.
- * Stable keys prevent duplicate subscriptions for identical topics.
+ * Subscriptions are routed through the shared registry so identical topics are
+ * reference-counted rather than opened per hook instance.
  */
 export function useRealtimeTopic<T>(
   topic: string,
@@ -47,6 +54,8 @@ export function useRealtimeTopic<T>(
     realtimeEnabled = true,
     connected = true,
     subscribe,
+    client,
+    registry,
   } = options;
 
   const [data, setData] = useState<T | undefined>(undefined);
@@ -83,7 +92,14 @@ export function useRealtimeTopic<T>(
     }
   }, []);
 
-  const realtimeActive = enabled && realtimeEnabled && connected && !!subscribe;
+  // Resolve the registry: explicit override, else the shared registry bound to
+  // the client. Falls back to a direct subscribe when neither is available.
+  const resolvedRegistry = registry ?? (client ? getRegistry(client) : undefined);
+  const subscribeFn = resolvedRegistry
+    ? (t: string, onEvent: (event: T) => void) => resolvedRegistry.subscribe<T>(t, onEvent)
+    : subscribe;
+
+  const realtimeActive = enabled && realtimeEnabled && connected && !!subscribeFn;
 
   // Snapshot fetch on mount / when the topic changes.
   useEffect(() => {
@@ -95,11 +111,11 @@ export function useRealtimeTopic<T>(
     };
   }, [topic, fetchSnapshot]);
 
-  // Realtime subscription lifecycle.
+  // Realtime subscription lifecycle (routed through the registry).
   useEffect(() => {
-    if (!realtimeActive || !subscribe) return;
+    if (!realtimeActive || !subscribeFn) return;
     setStatus('live');
-    const unsubscribe = subscribe(topic, (event) => {
+    const unsubscribe = subscribeFn(topic, (event) => {
       if (pendingEventsRef.current.length > 0) {
         pendingEventsRef.current.push(event);
       }
@@ -108,7 +124,7 @@ export function useRealtimeTopic<T>(
     return () => {
       unsubscribe();
     };
-  }, [topic, realtimeActive, subscribe, applyEvent]);
+  }, [topic, realtimeActive, subscribeFn, applyEvent]);
 
   // REST polling fallback when realtime is disabled or unavailable.
   useEffect(() => {
