@@ -1,4 +1,5 @@
 import { API_BASE_URL } from "@/lib/api/client";
+import { getRealtimeCapability } from "@/lib/realtime/capabilities";
 
 type Handler = (payload: unknown) => void;
 
@@ -13,6 +14,11 @@ const BASE_BACKOFF_MS = 1_000;
  * type (e.g. "oracle_update"). Callers must treat this connection as
  * best-effort — always keep an independent REST fetch as the source of
  * truth for initial state.
+ *
+ * Transport is negotiated at startup via `getRealtimeCapability()`. Until
+ * capability is confirmed the client stays on REST; it only opens a socket
+ * when the backend advertises WebSocket support, avoiding reconnect loops
+ * against backends that never answer.
  */
 class RealtimeClient {
   private socket: WebSocket | null = null;
@@ -20,11 +26,27 @@ class RealtimeClient {
   private attempt = 0;
   private closedByUser = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private negotiated = false;
 
   connect(): void {
     if (typeof WebSocket === "undefined" || this.socket) return;
     this.closedByUser = false;
-    this.open();
+    if (this.negotiated) {
+      this.open();
+      return;
+    }
+    void this.negotiate();
+  }
+
+  private async negotiate(): Promise<void> {
+    const capability = await getRealtimeCapability();
+    this.negotiated = true;
+    if (this.closedByUser) return;
+    if (capability.transport === "websocket") {
+      this.open();
+    }
+    // SSE and REST-only transports are handled elsewhere; this client only
+    // manages the WebSocket transport.
   }
 
   private open(): void {
