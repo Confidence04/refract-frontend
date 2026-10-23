@@ -7,6 +7,12 @@ const MAX_BACKOFF_MS = 30_000;
 const BASE_BACKOFF_MS = 1_000;
 
 /**
+ * Realtime WebSocket client.
+ *
+ * Handles connection lifecycle, subscription replay, and auth token expiry
+ * for wallet-scoped subscriptions. Token acquisition is isolated behind an
+ * injected AuthTokenProvider so the transport stays wallet-agnostic.
+ *
  * A small reconnecting WebSocket wrapper exposing a subscribe-by-topic API.
  * The backend contract this assumes (documented, not yet implemented
  * upstream): connect to `${wsUrl}`, receive JSON messages shaped
@@ -20,13 +26,69 @@ const BASE_BACKOFF_MS = 1_000;
  * when the backend advertises WebSocket support, avoiding reconnect loops
  * against backends that never answer.
  */
-class RealtimeClient {
+
+import type {
+  AuthTokenProvider,
+  AuthenticatedSubscription,
+  RealtimeAuthOptions,
+  RealtimeCloseCode,
+  RealtimeConnectionState,
+  RealtimeDegradedState,
+} from './types';
+
+const AUTH_CLOSE_CODES: ReadonlySet<number> = new Set([4001, 4003, 4401, 4403]);
+const DEFAULT_MAX_REFRESH_ATTEMPTS = 2;
+
+export interface RealtimeClientOptions extends RealtimeAuthOptions {
+  url: string;
+  onStateChange?: (state: RealtimeConnectionState) => void;
+  onDegraded?: (state: RealtimeDegradedState) => void;
+}
+ */
+
+import type {
+  AuthTokenProvider,
+  AuthenticatedSubscription,
+  RealtimeAuthOptions,
+  RealtimeCloseCode,
+  RealtimeConnectionState,
+  RealtimeDegradedState,
+} from './types';
+
+const AUTH_CLOSE_CODES: ReadonlySet<number> = new Set([4001, 4003, 4401, 4403]);
+const DEFAULT_MAX_REFRESH_ATTEMPTS = 2;
+
+export interface RealtimeClientOptions extends RealtimeAuthOptions {
+  url: string;
+  onStateChange?: (state: RealtimeConnectionState) => void;
+  onDegraded?: (state: RealtimeDegradedState) => void;
+}
+
+export class RealtimeClient {
+  private readonly url: string;
+  private readonly auth?: AuthTokenProvider;
+  private readonly maxRefreshAttempts: number;
+  private readonly onStateChange?: (state: RealtimeConnectionState) => void;
+  private readonly onDegraded?: (state: RealtimeDegradedState) => void;
+
   private socket: WebSocket | null = null;
+  private state: RealtimeConnectionState = 'idle';
+  private refreshAttempts = 0;
+  private refreshInFlight: Promise<string | null> | null = null;
+  private readonly authenticatedSubscriptions = new Map<string, AuthenticatedSubscription>();
   private handlers = new Map<string, Set<Handler>>();
   private attempt = 0;
   private closedByUser = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private negotiated = false;
+
+  constructor(options: RealtimeClientOptions) {
+    this.url = options.url;
+    this.auth = options.auth;
+    this.maxRefreshAttempts = options.maxRefreshAttempts ?? DEFAULT_MAX_REFRESH_ATTEMPTS;
+    this.onStateChange = options.onStateChange;
+    this.onDegraded = options.onDegraded;
+  }
 
   connect(): void {
     if (typeof WebSocket === "undefined" || this.socket) return;
@@ -49,61 +111,167 @@ class RealtimeClient {
     // manages the WebSocket transport.
   }
 
-  private open(): void {
-    const wsUrl = API_BASE_URL.replace(/^http/, "ws").replace(/\/api\/v1$/, "/ws");
-    try {
-      this.socket = new WebSocket(wsUrl);
-    } catch {
-      this.scheduleReconnect();
-      return;
-    }
-
-    this.socket.addEventListener("open", () => {
-      this.attempt = 0;
-    });
-    this.socket.addEventListener("message", (event) => {
-      try {
-        const { topic, payload } = JSON.parse(event.data as string) as { topic: string; payload: unknown };
-        this.handlers.get(topic)?.forEach((handler) => handler(payload));
-      } catch {
-        // Malformed message — ignore, don't crash the connection.
-      }
-    });
-    this.socket.addEventListener("close", () => {
-      this.socket = null;
-      if (!this.closedByUser) this.scheduleReconnect();
-    });
-    this.socket.addEventListener("error", () => {
-      this.socket?.close();
-    });
+  getState(): RealtimeConnectionState {
+    return this.state;
   }
 
-  private scheduleReconnect(): void {
-    if (this.reconnectTimer) return;
-    const delay = Math.min(BASE_BACKOFF_MS * 2 ** this.attempt, MAX_BACKOFF_MS);
-    this.attempt += 1;
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      if (!this.closedByUser) this.open();
-    }, delay);
+  /**
+   * Registers a wallet-scoped subscription that will be replayed after a
+   * successful re-authentication.
+   */
+  registerAuthenticatedSubscription(sub: AuthenticatedSubscription): void {
+    this.authenticatedSubscriptions.set(sub.topic, sub);
   }
 
-  subscribe(topic: string, handler: Handler): () => void {
-    if (!this.handlers.has(topic)) this.handlers.set(topic, new Set());
-    this.handlers.get(topic)!.add(handler);
-    this.connect();
+  unregisterAuthenticatedSubscription(topic: string): void {
+    this.authenticatedSubscriptions.delete(topic);
+  }
 
-    return () => {
-      this.handlers.get(topic)?.delete(handler);
-    };
+  async connect(): Promise<void> {
+    this.setState('connecting');
+    const token = await this.resolveToken();
+    this.openSocket(token);
   }
 
   disconnect(): void {
-    this.closedByUser = true;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.socket?.close();
+    this.socket?.close(1000, 'client disconnect');
     this.socket = null;
+    this.setState('closed');
+  }
+
+  private async resolveToken(): Promise<string | null> {
+    if (!this.auth) return null;
+    try {
+      return await this.auth.getAuthToken();
+    } catch {
+      return null;
+    }
+  }
+
+  private openSocket(token: string | null): void {
+    const url = token ? this.withToken(this.url, token) : this.url;
+    const socket = new WebSocket(url);
+    this.socket = socket;
+
+    socket.onopen = () => {
+      this.refreshAttempts = 0;
+      this.setState('connected');
+      this.replaySubscriptions();
+    };
+
+    socket.onmessage = (event) => {
+      if (this.isAuthErrorFrame(event.data)) {
+        void this.handleAuthFailure();
+      }
+    };
+
+    socket.onclose = (event) => {
+      if (this.isAuthCloseCode(event.code)) {
+        void this.handleAuthFailure();
+        return;
+      }
+      this.setState('closed');
+    };
+
+    socket.onerror = () => {
+      // Errors surface via onclose; nothing to do here.
+    };
+  }
+
+  private isAuthCloseCode(code: RealtimeCloseCode): boolean {
+    return AUTH_CLOSE_CODES.has(code);
+  }
+
+  private isAuthErrorFrame(data: unknown): boolean {
+    if (typeof data !== 'string') return false;
+    try {
+      const parsed = JSON.parse(data) as { type?: string; code?: number };
+      if (parsed?.type === 'error' && typeof parsed.code === 'number') {
+        return AUTH_CLOSE_CODES.has(parsed.code);
+      }
+      return parsed?.type === 'auth_error';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Handles an auth failure by refreshing the token and replaying
+   * wallet-scoped subscriptions. Guards against refresh loops and dedupes
+   * concurrent refreshes.
+   */
+  private async handleAuthFailure(): Promise<void> {
+    if (!this.auth) {
+      this.enterDegraded('auth-required', 'Authentication required for this subscription.');
+      return;
+    }
+
+    if (this.refreshAttempts >= this.maxRefreshAttempts) {
+      this.enterDegraded('auth-refresh-loop', 'Unable to re-authenticate. Showing cached data.');
+      return;
+    }
+
+    this.refreshAttempts += 1;
+    this.setState('reconnecting');
+
+    const token = await this.refreshTokenDeduped();
+    if (!token) {
+      this.enterDegraded('auth-refresh-failed', 'Session expired. Falling back to REST.');
+      return;
+    }
+
+    this.socket?.close(1000, 'reauth');
+    this.openSocket(token);
+  }
+
+  /**
+   * Dedupes concurrent refresh requests so multiple failing subscriptions
+   * share a single refresh call.
+   */
+  private refreshTokenDeduped(): Promise<string | null> {
+    if (this.refreshInFlight) return this.refreshInFlight;
+    if (!this.auth) return Promise.resolve(null);
+
+    this.refreshInFlight = this.auth
+      .refreshAuthToken()
+      .catch(() => null)
+      .finally(() => {
+        this.refreshInFlight = null;
+      });
+
+    return this.refreshInFlight;
+  }
+
+  private replaySubscriptions(): void {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+    for (const sub of this.authenticatedSubscriptions.values()) {
+      this.socket.send(
+        JSON.stringify({ type: 'subscribe', topic: sub.topic, wallet: sub.wallet, params: sub.params }),
+      );
+    }
+  }
+
+  private enterDegraded(
+    reason: RealtimeDegradedState['reason'],
+    message: string,
+  ): void {
+    this.setState('degraded');
+    this.onDegraded?.({ reason, fallbackToRest: true, message });
+  }
+
+  private withToken(url: string, token: string): string {
+    try {
+      const parsed = new URL(url);
+      parsed.searchParams.set('token', token);
+      return parsed.toString();
+    } catch {
+      return url;
+    }
+  }
+
+  private setState(state: RealtimeConnectionState): void {
+    if (this.state === state) return;
+    this.state = state;
+    this.onStateChange?.(state);
   }
 }
-
-export const realtimeClient = new RealtimeClient();
