@@ -2,62 +2,37 @@
 
 import { useEffect, useState } from "react";
 
-export type RealtimeHealthState =
-  | "live"
-  | "connecting"
-  | "reconnecting"
-  | "offline";
+import {
+  realtimeHealth,
+  RealtimeStatus,
+  type RealtimeHealthSnapshot,
+} from "../lib/realtime/health";
 
-export interface RealtimeHealth {
-  state: RealtimeHealthState;
-  lastEventAt: number | null;
-}
-
-const INITIAL_HEALTH: RealtimeHealth = {
-  state: "connecting",
-  lastEventAt: null,
-};
+export { RealtimeStatus };
+export type { RealtimeHealthSnapshot };
 
 /**
- * Reads the realtime connection health from the transport layer.
- *
- * This hook is intentionally transport-agnostic: it subscribes to a
- * global health source (if present) and falls back to a neutral
- * "connecting" state so SSR and client render match on first paint.
+ * Subscribe to realtime connection health. Backed by the observable
+ * `realtimeHealth` store so React re-renders on transitions rather than
+ * polling. `lastMessageAgeMs` is derived at read time from `lastMessageAt`.
  */
-export function useRealtimeHealth(): RealtimeHealth {
-  const [health, setHealth] = useState<RealtimeHealth>(INITIAL_HEALTH);
+export function useRealtimeHealth(): RealtimeHealthSnapshot {
+  const [snapshot, setSnapshot] = useState<RealtimeHealthSnapshot>(() =>
+    realtimeHealth.getSnapshot(),
+  );
 
   useEffect(() => {
-    const source = (
-      globalThis as {
-        __realtimeHealth?: {
-          getState?: () => RealtimeHealthState;
-          subscribe?: (
-            listener: (state: RealtimeHealthState) => void,
-          ) => () => void;
-        };
-      }
-    ).__realtimeHealth;
-
-    if (!source) {
-      return;
-    }
-
-    if (typeof source.getState === "function") {
-      const current = source.getState();
-      setHealth({ state: current, lastEventAt: Date.now() });
-    }
-
-    if (typeof source.subscribe === "function") {
-      const unsubscribe = source.subscribe((state) => {
-        setHealth({ state, lastEventAt: Date.now() });
-      });
-      return unsubscribe;
-    }
-
-    return;
+    const unsubscribe = realtimeHealth.subscribe((event) => {
+      setSnapshot(event.snapshot);
+    });
+    // Sync in case the store changed between render and subscription.
+    setSnapshot(realtimeHealth.getSnapshot());
+    return unsubscribe;
   }, []);
 
-  return health;
+  const lastMessageAgeMs =
+    snapshot.lastMessageAt === null ? null : Date.now() - snapshot.lastMessageAt;
+
+  return { ...snapshot, lastMessageAgeMs };
+}
 }

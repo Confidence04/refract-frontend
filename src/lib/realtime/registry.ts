@@ -1,4 +1,10 @@
 import type { RealtimeClient } from './client';
+import {
+  DEFAULT_REALTIME_LIMITS,
+  InboundRateLimiter,
+  RealtimeLimits,
+  decideAdmission,
+} from './limits';
 
 /**
  * Per-topic subscription registry with reference counting and lazy teardown.
@@ -44,13 +50,32 @@ export interface RegistryTransport {
   subscribe(topic: string, onEvent: (event: unknown) => void): () => void;
 }
 
+export interface RealtimeRegistryOptions {
+  limits?: RealtimeLimits;
+  /** Observability sink for rate-limit breaches and rejections. */
+  report?: (event: RealtimeObservabilityEvent) => void;
+}
+
+export interface RealtimeObservabilityEvent {
+  type: 'subscription-rejected' | 'rate-limit-breach';
+  topic?: string;
+  reason?: string;
+  breaches?: number;
+}
+
 export class SubscriptionRegistry {
   private readonly transport: RegistryTransport;
   private readonly topics = new Map<string, TopicState>();
   private readonly listeners = new Set<ChangeListener>();
+  private readonly limits: RealtimeLimits;
+  private readonly report?: (event: RealtimeObservabilityEvent) => void;
+  private readonly rateLimiter: InboundRateLimiter;
 
-  constructor(transport: RegistryTransport) {
+  constructor(transport: RegistryTransport, options: RealtimeRegistryOptions = {}) {
     this.transport = transport;
+    this.limits = options.limits ?? DEFAULT_REALTIME_LIMITS;
+    this.report = options.report;
+    this.rateLimiter = new InboundRateLimiter(this.limits);
   }
 
   /**
@@ -61,6 +86,16 @@ export class SubscriptionRegistry {
   subscribe<T = unknown>(topic: string, handler: TopicHandler<T>): () => void {
     let state = this.topics.get(topic);
     if (!state) {
+      const decision = decideAdmission([...this.topics.keys()], topic, this.limits);
+      if (!decision.admitted) {
+        this.report?.({ type: 'subscription-rejected', topic, reason: decision.reason });
+        // eslint-disable-next-line no-console
+        console.warn(`[realtime] subscription refused for "${topic}": ${decision.reason}`);
+        return () => {};
+      }
+      if (decision.evict) {
+        this.topics.delete(decision.evict);
+      }
       state = { handlers: new Set(), unsubscribeTransport: null, pendingTeardown: false };
       this.topics.set(topic, state);
     }
@@ -73,6 +108,10 @@ export class SubscriptionRegistry {
 
     if (!state.unsubscribeTransport) {
       state.unsubscribeTransport = this.transport.subscribe(topic, (event) => {
+        if (this.rateLimiter.record()) {
+          this.report?.({ type: 'rate-limit-breach', topic, breaches: this.rateLimiter.getBreachCount() });
+          return;
+        }
         const current = this.topics.get(topic);
         if (!current) return;
         for (const h of current.handlers) h(event);
@@ -119,6 +158,10 @@ export class SubscriptionRegistry {
       if (state.handlers.size === 0) continue;
       state.unsubscribeTransport?.();
       state.unsubscribeTransport = this.transport.subscribe(topic, (event) => {
+        if (this.rateLimiter.record()) {
+          this.report?.({ type: 'rate-limit-breach', topic, breaches: this.rateLimiter.getBreachCount() });
+          return;
+        }
         const current = this.topics.get(topic);
         if (!current) return;
         for (const h of current.handlers) h(event);
@@ -141,6 +184,10 @@ export class SubscriptionRegistry {
     return () => {
       this.listeners.delete(listener);
     };
+  }
+
+  getRateBreachCount(): number {
+    return this.rateLimiter.getBreachCount();
   }
 
   private emit(event: RegistryChangeEvent): void {
